@@ -5,48 +5,8 @@ import pycolmap.cost_functions
 import utils
 import configparser
 import argparse
-
-class Options:
-    def __init__(self, config):
-        # General section
-        self.input_folder = config.get("General", "input", fallback=None)
-        self.output_folder = config.get("General", "output", fallback=None)
-
-        # Problem section
-        self.bundle = config.getboolean("Problem", "bundle", fallback=None)
-        self.priors_file = config.get("Problem", "priors", fallback=None)
-        self.priors_delimiter = config.get("General", "priors_delimiter", fallback=";")
-        self.priors_rotations_from_rec = config.getboolean("Problem", "priors_rotations_from_rec", fallback=False)
-        priors_covariance_str = config.get("Problem", "priors_covariance", fallback="[1,1,1,1,1,1]")
-        if priors_covariance_str == "[]":  
-            priors_covariance_str = "[1,1,1,1,1,1]"
-        self.priors_covariance = self._parse_list(priors_covariance_str, float)
-        self.fix3D_points = config.getboolean("Problem", "fix3D_points", fallback=False)
-        self.use_priors_rotations = config.getboolean("Problem", "use_priors_rotations", fallback=False)
-        fixed_cameras_ids_str = config.get("Problem", "fixed_cameras_ids", fallback="[]")
-        self.fixed_cameras_ids = self._parse_list(fixed_cameras_ids_str)
-        self.transform_reconstruction = config.getboolean("Problem", "transform_reconstruction", fallback=False)
-        solver_options = pyceres.SolverOptions()
-        linear_solver_type = config.get("Solver", "linear_solver_type", fallback="SPARSE_SCHUR")
-        linear_solver_type_mapping = {
-            "SPARSE_SCHUR": pyceres.LinearSolverType.SPARSE_SCHUR,
-            "DENSE_QR": pyceres.LinearSolverType.DENSE_QR,
-            "None": pyceres.LinearSolverType.SPARSE_SCHUR,
-        }
-        solver_options.linear_solver_type = linear_solver_type_mapping.get(linear_solver_type, pyceres.LinearSolverType.SPARSE_SCHUR)
-        solver_options.minimizer_progress_to_stdout = config.getboolean("Solver", "minimizer_progress_to_stdout", fallback=False)
-        solver_options.num_threads = config.getint("Solver", "num_threads", fallback=4)
-        self.solver_options = solver_options
-
-    def _parse_list(self, list_str, value_type=int):
-        try:
-            return [value_type(x.strip()) for x in list_str.strip("[]").split(",") if x.strip()]
-        except ValueError:
-            raise ValueError(f"Invalid list format: {list_str}")
-
-    # def validate(self):
-    #     if not self.input_folder or not self.output_folder or self.bundle is None:
-    #         raise ValueError("Missing required parameters in the configuration file.")
+from options import Options  # Import the Options class
+from rig import Rig, read_rig_configuration
 
 def read_reconstruction(folder_path):
     try:
@@ -112,9 +72,13 @@ def define_problem(rec, options):
             prob.add_residual_block(cost, loss, [pose.rotation.quat, pose.translation])
             prob.set_manifold(pose.rotation.quat, pyceres.EigenQuaternionManifold())
 
+    # if options.bundle:
+    #     cost = pycolmap.cost_functions.ReprojErrorCost(cam.model, p.xy)
+    # elif options.rigs_file:
+    #     cost = pycolmap.cost_functions.RigReprojErrorCost(cam.model, p.xy, rigcam.cam_from_rig)
     if options.bundle:
         for im in rec.images.values():
-            cam = rec.cameras[im.camera_id]
+            cam = im.camera
             for p in im.points2D:
                 if p.point3D_id in rec.points3D:
                     cost = pycolmap.cost_functions.ReprojErrorCost(cam.model, p.xy)
@@ -130,12 +94,33 @@ def define_problem(rec, options):
                 im.cam_from_world.rotation.quat, pyceres.EigenQuaternionManifold()
             )
     
+    for rig in options.rigs:
+        for im in rec.images.values():
+            rigcam = rig.cameras[im.camera_id]
+            cam = im.camera
+            for p in im.points2D:
+                if p.point3D_id in rec.points3D:
+                    cost = pycolmap.cost_functions.RigReprojErrorCost(cam.model, p.xy, rigcam.cam_from_rig)
+                    pose = im.cam_from_world
+                    params = [
+                        pose.rotation.quat,
+                        pose.translation,
+                        rec.points3D[p.point3D_id].xyz,
+                        cam.params,
+                    ]
+                    prob.add_residual_block(cost, loss, params)
+            prob.set_manifold(
+                im.cam_from_world.rotation.quat, pyceres.EigenQuaternionManifold()
+            )
+
+    
+
     for cam_id in options.fixed_cameras_ids:
         prob.set_parameter_block_constant(rec.cameras[cam_id].params)
     if options.fix3D_points:
         for p in rec.points3D.values():
             prob.set_parameter_block_constant(p.xyz)
-    
+
     return prob
 
 def solve(prob, options):
@@ -170,9 +155,6 @@ def write_reconstruction(rec, output_folder):
     with open(output_folder + "/cloud_optimized.txt", "w") as f:
         for p in rec.points3D:
             print(f"{rec.points3D[p].xyz[0]},{rec.points3D[p].xyz[1]},{rec.points3D[p].xyz[2]}",file=f)
-    # with open(output_folder + "/initial.txt", "w") as f:
-    #     for im in rec_gt.images.values():
-    #         print(f"{im.projection_center()[0]},{im.projection_center()[1]},{im.projection_center()[2]}",file=f)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -189,10 +171,23 @@ def main():
     reconstruction = read_reconstruction(options.input_folder)
         
     if options.priors_file:
-        priors = read_priors(reconstruction, options)
+        read_priors(reconstruction, options)
         if options.transform_reconstruction:
             T = transform_reconstruction(reconstruction, options)
-            print("Affine transformation on priors positions:", T)
+            with open(options.output_folder + "/transformation_matrix.txt", "w") as f:
+                print("Affine transformation on priors positions:", file=f)
+                for i in range(4):
+                    print(f"{T[i][0]} {T[i][1]} {T[i][2]} {T[i][3]}",file=f)
+            T = np.linalg.inv(T)
+            f.close()
+            with open(options.output_folder + "/transformation_matrix.txt", "a") as f:
+                print("\n Inverse transformation matrix:", file=f)
+                for i in range(4):
+                    print(f"{T[i][0]} {T[i][1]} {T[i][2]} {T[i][3]}",file=f)
+            f.close()
+    if options.rigs_file:
+        options.rigs = read_rig_configuration(options.rigs_file)
+        
     problem = define_problem(reconstruction, options)
     solve(problem, options)
     
